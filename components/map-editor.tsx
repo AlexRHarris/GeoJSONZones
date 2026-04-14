@@ -6,7 +6,6 @@ import "leaflet/dist/leaflet.css"
 import "leaflet-draw"
 import "leaflet-draw/dist/leaflet.draw.css"
 import * as turf from "@turf/turf"
-import polygonClipping from "polygon-clipping"
 import {
   Map,
   Layers,
@@ -23,7 +22,6 @@ import {
   Clock,
   MapPin,
 } from "lucide-react"
-import { cn } from "@/lib/utils"
 
 interface Zone {
   id: string
@@ -31,184 +29,143 @@ interface Zone {
   color: string
   geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon
   properties: Record<string, unknown>
-  groupId?: string
-}
-
-interface Stats {
-  totalZones: number
-  totalArea: number
-  totalPerimeter: number
 }
 
 const ZONE_COLORS = [
-  "#3b82f6",
-  "#10b981",
-  "#f59e0b",
-  "#ef4444",
-  "#8b5cf6",
-  "#ec4899",
-  "#06b6d4",
-  "#84cc16",
+  "#3b82f6", "#10b981", "#f59e0b", "#ef4444",
+  "#8b5cf6", "#ec4899", "#06b6d4", "#84cc16",
 ]
 
 const RING_COLORS = [
   ["#1e40af", "#3b82f6", "#93c5fd"],
   ["#065f46", "#10b981", "#6ee7b7"],
   ["#92400e", "#f59e0b", "#fcd34d"],
-  ["#991b1b", "#ef4444", "#fca5a5"],
-  ["#5b21b6", "#8b5cf6", "#c4b5fd"],
 ]
+
+function cn(...classes: (string | boolean | undefined)[]) {
+  return classes.filter(Boolean).join(" ")
+}
 
 export default function MapEditor() {
   const mapRef = useRef<HTMLDivElement>(null)
   const mapInstanceRef = useRef<L.Map | null>(null)
   const drawnItemsRef = useRef<L.FeatureGroup | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const zoneLayerMapRef = useRef<Map<string, L.Layer>>(new Map())
 
   const [zones, setZones] = useState<Zone[]>([])
   const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null)
-  const [stats, setStats] = useState<Stats>({ totalZones: 0, totalArea: 0, totalPerimeter: 0 })
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [simplifyTolerance, setSimplifyTolerance] = useState(0.001)
   const [showSettings, setShowSettings] = useState(false)
   const [showDriveTime, setShowDriveTime] = useState(false)
   const [driveTimeMinutes, setDriveTimeMinutes] = useState<number[]>([5, 10, 15])
   const [isPlacingMarker, setIsPlacingMarker] = useState(false)
-  const [isCutMode, setIsCutMode] = useState(false)
 
-  useEffect(() => {
-    let totalArea = 0
-    let totalPerimeter = 0
-
-    zones.forEach((zone) => {
+  // Calculate stats
+  const stats = {
+    totalZones: zones.length,
+    totalArea: zones.reduce((acc, z) => {
       try {
-        const feature = turf.feature(zone.geometry)
-        totalArea += turf.area(feature)
-        if (zone.geometry.type === "Polygon") {
-          const line = turf.polygonToLine(feature as turf.Feature<turf.Polygon>)
-          if (line.type === "Feature") {
-            totalPerimeter += turf.length(line, { units: "kilometers" })
-          }
-        }
+        return acc + turf.area(turf.feature(z.geometry)) / 1_000_000
       } catch {
-        // Skip invalid geometries
+        return acc
       }
-    })
+    }, 0),
+  }
 
-    setStats({
-      totalZones: zones.length,
-      totalArea: totalArea / 1_000_000,
-      totalPerimeter,
-    })
-  }, [zones])
-
-  // Split a polygon with a line using polygon-clipping
+  // Split polygon using line - creates two half-planes and intersects
   const splitPolygonWithLine = useCallback((
     polygon: GeoJSON.Polygon | GeoJSON.MultiPolygon,
     lineCoords: [number, number][]
-  ): (GeoJSON.Polygon | GeoJSON.MultiPolygon)[] => {
-    if (lineCoords.length < 2) return [polygon]
-
-    // Get polygon bounds to extend the line
-    const feature = turf.feature(polygon)
-    const bbox = turf.bbox(feature)
-    const bboxWidth = bbox[2] - bbox[0]
-    const bboxHeight = bbox[3] - bbox[1]
-    const extend = Math.max(bboxWidth, bboxHeight) * 2
-
-    // Calculate line direction
-    const start = lineCoords[0]
-    const end = lineCoords[lineCoords.length - 1]
-    const dx = end[0] - start[0]
-    const dy = end[1] - start[1]
-    const len = Math.sqrt(dx * dx + dy * dy)
-    
-    if (len === 0) return [polygon]
-
-    const ux = dx / len
-    const uy = dy / len
-
-    // Extend line in both directions
-    const extendedStart: [number, number] = [start[0] - ux * extend, start[1] - uy * extend]
-    const extendedEnd: [number, number] = [end[0] + ux * extend, end[1] + uy * extend]
-
-    // Create a thin rectangle (blade) from the line
-    const bladeWidth = 0.00001 // Very thin
-    const perpX = -uy * bladeWidth
-    const perpY = ux * bladeWidth
-
-    // Build blade polygon coordinates
-    const bladeCoords: [number, number][] = [
-      [extendedStart[0] + perpX, extendedStart[1] + perpY],
-      [extendedEnd[0] + perpX, extendedEnd[1] + perpY],
-      [extendedEnd[0] - perpX, extendedEnd[1] - perpY],
-      [extendedStart[0] - perpX, extendedStart[1] - perpY],
-      [extendedStart[0] + perpX, extendedStart[1] + perpY],
-    ]
-
-    // Create two half-plane polygons (one on each side of the line)
-    const halfPlaneSize = extend * 2
-    
-    const halfPlane1Coords: [number, number][] = [
-      [extendedStart[0] + perpX, extendedStart[1] + perpY],
-      [extendedEnd[0] + perpX, extendedEnd[1] + perpY],
-      [extendedEnd[0] + perpX - uy * halfPlaneSize, extendedEnd[1] + perpY + ux * halfPlaneSize],
-      [extendedStart[0] + perpX - uy * halfPlaneSize, extendedStart[1] + perpY + ux * halfPlaneSize],
-      [extendedStart[0] + perpX, extendedStart[1] + perpY],
-    ]
-
-    const halfPlane2Coords: [number, number][] = [
-      [extendedStart[0] - perpX, extendedStart[1] - perpY],
-      [extendedEnd[0] - perpX, extendedEnd[1] - perpY],
-      [extendedEnd[0] - perpX + uy * halfPlaneSize, extendedEnd[1] - perpY - ux * halfPlaneSize],
-      [extendedStart[0] - perpX + uy * halfPlaneSize, extendedStart[1] - perpY - ux * halfPlaneSize],
-      [extendedStart[0] - perpX, extendedStart[1] - perpY],
-    ]
+  ): GeoJSON.Polygon[] => {
+    if (lineCoords.length < 2) return []
 
     try {
-      // Convert polygon to polygon-clipping format
-      let polygonCoords: polygonClipping.Polygon[]
-      if (polygon.type === "Polygon") {
-        polygonCoords = [polygon.coordinates.map(ring => ring.map(c => [c[0], c[1]] as [number, number]))]
-      } else {
-        polygonCoords = polygon.coordinates.map(poly => 
-          poly.map(ring => ring.map(c => [c[0], c[1]] as [number, number]))
-        )
+      const poly = turf.feature(polygon)
+      const line = turf.lineString(lineCoords)
+
+      // Check if line intersects polygon
+      if (!turf.booleanIntersects(line, poly)) {
+        return []
       }
 
-      const results: (GeoJSON.Polygon | GeoJSON.MultiPolygon)[] = []
+      // Get bounding box and extend
+      const bbox = turf.bbox(poly)
+      const bboxPoly = turf.bboxPolygon(bbox)
+      const buffered = turf.buffer(bboxPoly, 10, { units: "kilometers" })
+      if (!buffered) return []
+      
+      const bigBbox = turf.bbox(buffered)
+      const size = Math.max(bigBbox[2] - bigBbox[0], bigBbox[3] - bigBbox[1]) * 2
+
+      // Get line direction
+      const start = lineCoords[0]
+      const end = lineCoords[lineCoords.length - 1]
+      const dx = end[0] - start[0]
+      const dy = end[1] - start[1]
+      const len = Math.sqrt(dx * dx + dy * dy)
+      if (len === 0) return []
+
+      const ux = dx / len
+      const uy = dy / len
+      const perpX = -uy
+      const perpY = ux
+
+      // Extend line
+      const extStart: [number, number] = [start[0] - ux * size, start[1] - uy * size]
+      const extEnd: [number, number] = [end[0] + ux * size, end[1] + uy * size]
+
+      // Create two half-plane polygons
+      const halfPlane1: [number, number][] = [
+        extStart,
+        extEnd,
+        [extEnd[0] + perpX * size, extEnd[1] + perpY * size],
+        [extStart[0] + perpX * size, extStart[1] + perpY * size],
+        extStart,
+      ]
+
+      const halfPlane2: [number, number][] = [
+        extStart,
+        extEnd,
+        [extEnd[0] - perpX * size, extEnd[1] - perpY * size],
+        [extStart[0] - perpX * size, extStart[1] - perpY * size],
+        extStart,
+      ]
+
+      const results: GeoJSON.Polygon[] = []
 
       // Intersect with each half-plane
-      for (const halfPlane of [halfPlane1Coords, halfPlane2Coords]) {
-        for (const poly of polygonCoords) {
-          try {
-            const intersection = polygonClipping.intersection([poly], [[halfPlane]])
-            
-            if (intersection && intersection.length > 0) {
-              for (const resultPoly of intersection) {
-                if (resultPoly.length > 0 && resultPoly[0].length >= 4) {
-                  const geom: GeoJSON.Polygon = {
-                    type: "Polygon",
-                    coordinates: resultPoly,
-                  }
-                  // Check if it has meaningful area
-                  const area = turf.area(turf.feature(geom))
-                  if (area > 10) { // More than 10 square meters
-                    results.push(geom)
-                  }
+      for (const hp of [halfPlane1, halfPlane2]) {
+        try {
+          const halfPlanePoly = turf.polygon([hp])
+          const intersection = turf.intersect(
+            turf.featureCollection([poly, halfPlanePoly])
+          )
+
+          if (intersection) {
+            if (intersection.geometry.type === "Polygon") {
+              const area = turf.area(intersection)
+              if (area > 100) {
+                results.push(intersection.geometry)
+              }
+            } else if (intersection.geometry.type === "MultiPolygon") {
+              for (const coords of intersection.geometry.coordinates) {
+                const p: GeoJSON.Polygon = { type: "Polygon", coordinates: coords }
+                const area = turf.area(turf.feature(p))
+                if (area > 100) {
+                  results.push(p)
                 }
               }
             }
-          } catch {
-            // Skip failed intersections
           }
+        } catch {
+          // Skip failed intersection
         }
       }
 
-      return results.length > 0 ? results : [polygon]
+      return results
     } catch {
-      return [polygon]
+      return []
     }
   }, [])
 
@@ -216,42 +173,26 @@ export default function MapEditor() {
   const cutAllZonesWithLine = useCallback((lineCoords: [number, number][]) => {
     if (lineCoords.length < 2) return
 
-    const line = turf.lineString(lineCoords)
-
     setZones((prevZones) => {
       const newZones: Zone[] = []
       let counter = 0
 
       for (const zone of prevZones) {
-        try {
-          // Check if line intersects this zone
-          const polygon = turf.feature(zone.geometry)
-          const intersects = turf.booleanIntersects(line, polygon)
+        const splitResults = splitPolygonWithLine(zone.geometry, lineCoords)
 
-          if (!intersects) {
-            newZones.push(zone)
-            continue
-          }
-
-          // Split the polygon
-          const splitResults = splitPolygonWithLine(zone.geometry, lineCoords)
-
-          if (splitResults.length <= 1) {
-            newZones.push(zone)
-            continue
-          }
-
-          // Create new zones from split results
+        if (splitResults.length >= 2) {
+          // Zone was split
           splitResults.forEach((geom, i) => {
             counter++
             newZones.push({
               ...zone,
               id: `zone-${Date.now()}-${counter}`,
-              name: `${zone.name} (${String.fromCharCode(65 + i)})`,
+              name: `${zone.name} ${String.fromCharCode(65 + i)}`,
               geometry: geom,
             })
           })
-        } catch {
+        } else {
+          // Zone was not split, keep original
           newZones.push(zone)
         }
       }
@@ -271,7 +212,7 @@ export default function MapEditor() {
     })
 
     L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+      attribution: '&copy; OpenStreetMap',
       maxZoom: 19,
     }).addTo(map)
 
@@ -287,23 +228,13 @@ export default function MapEditor() {
         polygon: {
           allowIntersection: false,
           showArea: true,
-          shapeOptions: {
-            color: ZONE_COLORS[0],
-            fillOpacity: 0.3,
-          },
+          shapeOptions: { color: ZONE_COLORS[0], fillOpacity: 0.3 },
         },
         rectangle: {
-          shapeOptions: {
-            color: ZONE_COLORS[0],
-            fillOpacity: 0.3,
-          },
+          shapeOptions: { color: ZONE_COLORS[0], fillOpacity: 0.3 },
         },
         polyline: {
-          shapeOptions: {
-            color: "#ff0000",
-            weight: 3,
-            dashArray: "10, 10",
-          },
+          shapeOptions: { color: "#ff0000", weight: 3, dashArray: "10, 10" },
         },
         circle: false,
         circlemarker: false,
@@ -323,46 +254,39 @@ export default function MapEditor() {
       const layerType = e.layerType
 
       if (layerType === "polyline") {
-        // This is a cut line
+        // Cut line - split all intersecting zones
         const polyline = layer as L.Polyline
         const latLngs = polyline.getLatLngs() as L.LatLng[]
-        
         if (latLngs.length >= 2) {
           const lineCoords: [number, number][] = latLngs.map((ll) => [ll.lng, ll.lat])
           cutAllZonesWithLine(lineCoords)
         }
-        // Don't add the line to the map
-        return
+        return // Don't add line to map
       }
 
-      // It's a polygon or rectangle
+      // Polygon or rectangle
       const polygon = layer as L.Polygon
       const geoJson = polygon.toGeoJSON() as GeoJSON.Feature<GeoJSON.Polygon>
-      
+
       setZones((prev) => {
         const colorIndex = prev.length % ZONE_COLORS.length
-        const newZone: Zone = {
+        return [...prev, {
           id: `zone-${Date.now()}`,
           name: `Zone ${prev.length + 1}`,
           color: ZONE_COLORS[colorIndex],
           geometry: geoJson.geometry,
           properties: {},
-        }
-        return [...prev, newZone]
+        }]
       })
     })
 
     // Handle edited shapes
     map.on(L.Draw.Event.EDITED, (e: L.DrawEvents.Edited) => {
       const layers = e.layers
-      const updates: { id: string; geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon }[] = []
+      const updates: { id: string; geometry: GeoJSON.Polygon }[] = []
 
       layers.eachLayer((layer) => {
-        const layerAny = layer as L.Layer & { zoneId?: string }
-        
-        // Get zoneId from the layer
-        const zoneId = layerAny.zoneId
-        
+        const zoneId = (layer as L.Layer & { zoneId?: string }).zoneId
         if (zoneId && layer instanceof L.Polygon) {
           const geoJson = layer.toGeoJSON() as GeoJSON.Feature<GeoJSON.Polygon>
           updates.push({ id: zoneId, geometry: geoJson.geometry })
@@ -381,16 +305,11 @@ export default function MapEditor() {
 
     // Handle deleted shapes
     map.on(L.Draw.Event.DELETED, (e: L.DrawEvents.Deleted) => {
-      const layers = e.layers
       const deletedIds: string[] = []
-
-      layers.eachLayer((layer) => {
-        const layerAny = layer as L.Layer & { zoneId?: string }
-        if (layerAny.zoneId) {
-          deletedIds.push(layerAny.zoneId)
-        }
+      e.layers.eachLayer((layer) => {
+        const zoneId = (layer as L.Layer & { zoneId?: string }).zoneId
+        if (zoneId) deletedIds.push(zoneId)
       })
-
       if (deletedIds.length > 0) {
         setZones((prev) => prev.filter((z) => !deletedIds.includes(z.id)))
       }
@@ -404,50 +323,41 @@ export default function MapEditor() {
     }
   }, [cutAllZonesWithLine])
 
-  // Sync zones to map layers
+  // Sync zones to map
   useEffect(() => {
-    if (!drawnItemsRef.current || !mapInstanceRef.current) return
+    if (!drawnItemsRef.current) return
 
     drawnItemsRef.current.clearLayers()
-    zoneLayerMapRef.current.clear()
 
     zones.forEach((zone) => {
       try {
-        const polygon = L.polygon(
-          zone.geometry.type === "Polygon"
-            ? zone.geometry.coordinates[0].map((c) => [c[1], c[0]] as [number, number])
-            : zone.geometry.coordinates[0][0].map((c) => [c[1], c[0]] as [number, number]),
-          {
-            color: zone.color,
-            fillColor: zone.color,
-            fillOpacity: selectedZoneId === zone.id ? 0.5 : 0.3,
-            weight: selectedZoneId === zone.id ? 3 : 2,
-          }
-        )
+        const coords = zone.geometry.type === "Polygon"
+          ? zone.geometry.coordinates[0].map((c) => [c[1], c[0]] as L.LatLngTuple)
+          : zone.geometry.coordinates[0][0].map((c) => [c[1], c[0]] as L.LatLngTuple)
 
-        // Attach zoneId for edit/delete handling
-        ;(polygon as L.Polygon & { zoneId?: string }).zoneId = zone.id
-
-        polygon.on("click", () => {
-          setSelectedZoneId(zone.id)
+        const polygon = L.polygon(coords, {
+          color: zone.color,
+          fillColor: zone.color,
+          fillOpacity: selectedZoneId === zone.id ? 0.5 : 0.3,
+          weight: selectedZoneId === zone.id ? 3 : 2,
         })
 
+        // Attach zoneId for edit/delete
+        ;(polygon as L.Polygon & { zoneId: string }).zoneId = zone.id
+
+        polygon.on("click", () => setSelectedZoneId(zone.id))
         drawnItemsRef.current?.addLayer(polygon)
-        zoneLayerMapRef.current.set(zone.id, polygon)
       } catch {
-        // Skip invalid geometries
+        // Skip invalid geometry
       }
     })
   }, [zones, selectedZoneId])
 
-  // Generate drive-time rings
+  // Generate drive-time rings (non-overlapping donuts)
   const generateDriveTimeRings = useCallback((latlng: L.LatLng) => {
-    const center = [latlng.lng, latlng.lat] as [number, number]
-    const groupId = `drivetime-${Date.now()}`
-    const colorSetIndex = Math.floor(Math.random() * RING_COLORS.length)
-    const colorSet = RING_COLORS[colorSetIndex]
-
+    const center: [number, number] = [latlng.lng, latlng.lat]
     const sortedMinutes = [...driveTimeMinutes].sort((a, b) => a - b)
+    const colorSet = RING_COLORS[Math.floor(Math.random() * RING_COLORS.length)]
     const kmPerMinute = 1.2
 
     const newZones: Zone[] = []
@@ -461,14 +371,8 @@ export default function MapEditor() {
 
       if (previousCircle) {
         try {
-          const donut = turf.difference(
-            turf.featureCollection([circle, previousCircle])
-          )
-          if (donut) {
-            ringGeometry = donut.geometry as GeoJSON.Polygon | GeoJSON.MultiPolygon
-          } else {
-            ringGeometry = circle.geometry
-          }
+          const donut = turf.difference(turf.featureCollection([circle, previousCircle]))
+          ringGeometry = donut ? donut.geometry as GeoJSON.Polygon : circle.geometry
         } catch {
           ringGeometry = circle.geometry
         }
@@ -477,17 +381,12 @@ export default function MapEditor() {
       }
 
       const prevMinutes = index === 0 ? 0 : sortedMinutes[index - 1]
-
       newZones.push({
         id: `zone-${Date.now()}-${index}`,
         name: `${prevMinutes}-${minutes} min`,
         color: colorSet[Math.min(index, colorSet.length - 1)],
         geometry: ringGeometry,
-        properties: {
-          driveTimeMinutes: minutes,
-          driveTimeRange: `${prevMinutes}-${minutes}`,
-        },
-        groupId,
+        properties: { driveTimeRange: `${prevMinutes}-${minutes}` },
       })
 
       previousCircle = circle
@@ -496,26 +395,21 @@ export default function MapEditor() {
     setZones((prev) => [...prev, ...newZones])
     setIsPlacingMarker(false)
 
+    // Fit bounds to new rings
     if (mapInstanceRef.current && newZones.length > 0) {
       const lastRing = newZones[newZones.length - 1]
       const bbox = turf.bbox(turf.feature(lastRing.geometry))
-      mapInstanceRef.current.fitBounds([
-        [bbox[1], bbox[0]],
-        [bbox[3], bbox[2]],
-      ])
+      mapInstanceRef.current.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]])
     }
   }, [driveTimeMinutes])
 
-  // Handle marker placement
+  // Handle marker placement for drive-time
   useEffect(() => {
     if (!mapInstanceRef.current) return
-
     const map = mapInstanceRef.current
 
     const handleClick = (e: L.LeafletMouseEvent) => {
-      if (isPlacingMarker) {
-        generateDriveTimeRings(e.latlng)
-      }
+      if (isPlacingMarker) generateDriveTimeRings(e.latlng)
     }
 
     if (isPlacingMarker) {
@@ -532,29 +426,20 @@ export default function MapEditor() {
   }, [isPlacingMarker, generateDriveTimeRings])
 
   const handleExportGeoJSON = () => {
-    const featureCollection: GeoJSON.FeatureCollection = {
+    const fc: GeoJSON.FeatureCollection = {
       type: "FeatureCollection",
-      features: zones.map((zone) => ({
+      features: zones.map((z) => ({
         type: "Feature",
-        id: zone.id,
-        properties: {
-          name: zone.name,
-          color: zone.color,
-          ...zone.properties,
-        },
-        geometry: zone.geometry,
+        id: z.id,
+        properties: { name: z.name, color: z.color, ...z.properties },
+        geometry: z.geometry,
       })),
     }
-
-    const blob = new Blob([JSON.stringify(featureCollection, null, 2)], {
-      type: "application/json",
-    })
-    const url = URL.createObjectURL(blob)
+    const blob = new Blob([JSON.stringify(fc, null, 2)], { type: "application/json" })
     const a = document.createElement("a")
-    a.href = url
+    a.href = URL.createObjectURL(blob)
     a.download = "zones.geojson"
     a.click()
-    URL.revokeObjectURL(url)
   }
 
   const handleImportGeoJSON = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -565,35 +450,24 @@ export default function MapEditor() {
     reader.onload = (event) => {
       try {
         const geoJson = JSON.parse(event.target?.result as string) as GeoJSON.FeatureCollection
-        if (geoJson.type !== "FeatureCollection") {
-          alert("Invalid GeoJSON: Must be a FeatureCollection")
-          return
-        }
-
-        const importedZones: Zone[] = geoJson.features
+        const imported: Zone[] = geoJson.features
           .filter((f) => f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon")
           .map((f, i) => ({
             id: `zone-${Date.now()}-${i}`,
-            name: (f.properties?.name as string) || `Imported Zone ${i + 1}`,
+            name: (f.properties?.name as string) || `Imported ${i + 1}`,
             color: (f.properties?.color as string) || ZONE_COLORS[i % ZONE_COLORS.length],
-            geometry: f.geometry as GeoJSON.Polygon | GeoJSON.MultiPolygon,
+            geometry: f.geometry as GeoJSON.Polygon,
             properties: f.properties || {},
           }))
 
-        setZones((prev) => [...prev, ...importedZones])
+        setZones((prev) => [...prev, ...imported])
 
-        if (importedZones.length > 0 && mapInstanceRef.current) {
-          const allFeatures = turf.featureCollection(
-            importedZones.map((z) => turf.feature(z.geometry))
-          )
-          const bbox = turf.bbox(allFeatures)
-          mapInstanceRef.current.fitBounds([
-            [bbox[1], bbox[0]],
-            [bbox[3], bbox[2]],
-          ])
+        if (imported.length > 0 && mapInstanceRef.current) {
+          const bbox = turf.bbox(turf.featureCollection(imported.map((z) => turf.feature(z.geometry))))
+          mapInstanceRef.current.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]])
         }
       } catch {
-        alert("Failed to parse GeoJSON file")
+        alert("Failed to parse GeoJSON")
       }
     }
     reader.readAsText(file)
@@ -601,29 +475,23 @@ export default function MapEditor() {
   }
 
   const handleCopyGeoJSON = () => {
-    const featureCollection: GeoJSON.FeatureCollection = {
+    const fc: GeoJSON.FeatureCollection = {
       type: "FeatureCollection",
-      features: zones.map((zone) => ({
+      features: zones.map((z) => ({
         type: "Feature",
-        id: zone.id,
-        properties: {
-          name: zone.name,
-          color: zone.color,
-          ...zone.properties,
-        },
-        geometry: zone.geometry,
+        id: z.id,
+        properties: { name: z.name, color: z.color, ...z.properties },
+        geometry: z.geometry,
       })),
     }
-
-    navigator.clipboard.writeText(JSON.stringify(featureCollection, null, 2))
+    navigator.clipboard.writeText(JSON.stringify(fc, null, 2))
   }
 
   const handleSimplifyAll = () => {
     setZones((prev) =>
       prev.map((zone) => {
         try {
-          const feature = turf.feature(zone.geometry)
-          const simplified = turf.simplify(feature, {
+          const simplified = turf.simplify(turf.feature(zone.geometry), {
             tolerance: simplifyTolerance,
             highQuality: true,
           })
@@ -635,334 +503,266 @@ export default function MapEditor() {
     )
   }
 
-  const handleClearAll = () => {
-    if (confirm("Are you sure you want to delete all zones?")) {
-      setZones([])
-      setSelectedZoneId(null)
-    }
-  }
-
-  const handleDeleteZone = (id: string) => {
-    setZones((prev) => prev.filter((z) => z.id !== id))
-    if (selectedZoneId === id) {
-      setSelectedZoneId(null)
-    }
-  }
-
   const handleZoomToZone = (zone: Zone) => {
     if (!mapInstanceRef.current) return
-    try {
-      const feature = turf.feature(zone.geometry)
-      const bbox = turf.bbox(feature)
-      mapInstanceRef.current.fitBounds([
-        [bbox[1], bbox[0]],
-        [bbox[3], bbox[2]],
-      ])
-      setSelectedZoneId(zone.id)
-    } catch {
-      // Ignore errors
-    }
-  }
-
-  const handleRenameZone = (id: string, newName: string) => {
-    setZones((prev) => prev.map((z) => (z.id === id ? { ...z, name: newName } : z)))
-  }
-
-  const handleChangeZoneColor = (id: string, newColor: string) => {
-    setZones((prev) => prev.map((z) => (z.id === id ? { ...z, color: newColor } : z)))
-  }
-
-  const addDriveTimeValue = () => {
-    const maxValue = Math.max(...driveTimeMinutes, 0)
-    setDriveTimeMinutes([...driveTimeMinutes, maxValue + 5])
-  }
-
-  const removeDriveTimeValue = (index: number) => {
-    if (driveTimeMinutes.length > 1) {
-      setDriveTimeMinutes(driveTimeMinutes.filter((_, i) => i !== index))
-    }
-  }
-
-  const updateDriveTimeValue = (index: number, value: number) => {
-    const newValues = [...driveTimeMinutes]
-    newValues[index] = Math.max(1, value)
-    setDriveTimeMinutes(newValues)
+    const bbox = turf.bbox(turf.feature(zone.geometry))
+    mapInstanceRef.current.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]])
+    setSelectedZoneId(zone.id)
   }
 
   return (
-    <div className="flex h-screen w-full overflow-hidden">
+    <div className="flex h-screen w-full overflow-hidden bg-[hsl(222,47%,11%)]">
       {/* Sidebar */}
-      <div
-        className={cn(
-          "flex flex-col border-r border-border bg-card transition-all duration-300",
-          sidebarOpen ? "w-80" : "w-0"
-        )}
-      >
-        {sidebarOpen && (
-          <>
-            <div className="flex items-center gap-2 border-b border-border p-4">
-              <Map className="h-5 w-5 text-primary" />
-              <h1 className="text-lg font-semibold">GeoJSON Zones</h1>
-            </div>
+      <div className={cn(
+        "flex flex-col border-r border-[hsl(217,33%,25%)] bg-[hsl(222,47%,14%)] transition-all duration-300",
+        sidebarOpen ? "w-80" : "w-0 overflow-hidden"
+      )}>
+        <div className="flex items-center gap-2 border-b border-[hsl(217,33%,25%)] p-4">
+          <Map className="h-5 w-5 text-[hsl(217,91%,60%)]" />
+          <h1 className="text-lg font-semibold text-white">GeoJSON Zones</h1>
+        </div>
 
-            <div className="grid grid-cols-3 gap-2 border-b border-border p-4">
-              <div className="rounded-lg bg-muted p-2 text-center">
-                <p className="text-xs text-muted-foreground">Zones</p>
-                <p className="text-lg font-bold">{stats.totalZones}</p>
+        {/* Stats */}
+        <div className="grid grid-cols-2 gap-2 border-b border-[hsl(217,33%,25%)] p-4">
+          <div className="rounded-lg bg-[hsl(217,33%,20%)] p-2 text-center">
+            <p className="text-xs text-[hsl(215,20%,65%)]">Zones</p>
+            <p className="text-lg font-bold text-white">{stats.totalZones}</p>
+          </div>
+          <div className="rounded-lg bg-[hsl(217,33%,20%)] p-2 text-center">
+            <p className="text-xs text-[hsl(215,20%,65%)]">Area (km²)</p>
+            <p className="text-lg font-bold text-white">{stats.totalArea.toFixed(1)}</p>
+          </div>
+        </div>
+
+        {/* Action buttons */}
+        <div className="flex flex-wrap gap-2 border-b border-[hsl(217,33%,25%)] p-4">
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            className="flex items-center gap-1.5 rounded-md bg-[hsl(217,33%,25%)] px-3 py-2 text-sm font-medium text-white hover:bg-[hsl(217,33%,30%)]"
+          >
+            <Upload className="h-4 w-4" />
+            Import
+          </button>
+          <input ref={fileInputRef} type="file" accept=".geojson,.json" onChange={handleImportGeoJSON} className="hidden" />
+          <button
+            onClick={handleExportGeoJSON}
+            disabled={zones.length === 0}
+            className="flex items-center gap-1.5 rounded-md bg-[hsl(217,91%,60%)] px-3 py-2 text-sm font-medium text-white hover:bg-[hsl(217,91%,50%)] disabled:opacity-50"
+          >
+            <Download className="h-4 w-4" />
+            Export
+          </button>
+          <button
+            onClick={handleCopyGeoJSON}
+            disabled={zones.length === 0}
+            className="flex items-center gap-1.5 rounded-md bg-[hsl(217,33%,25%)] px-3 py-2 text-sm font-medium text-white hover:bg-[hsl(217,33%,30%)] disabled:opacity-50"
+          >
+            <Copy className="h-4 w-4" />
+          </button>
+          <button
+            onClick={() => { if (confirm("Delete all zones?")) setZones([]) }}
+            disabled={zones.length === 0}
+            className="flex items-center gap-1.5 rounded-md bg-[hsl(0,84%,60%)] px-3 py-2 text-sm font-medium text-white hover:bg-[hsl(0,84%,50%)] disabled:opacity-50"
+          >
+            <Trash2 className="h-4 w-4" />
+          </button>
+        </div>
+
+        {/* Drive Time section */}
+        <div className="border-b border-[hsl(217,33%,25%)]">
+          <button
+            onClick={() => setShowDriveTime(!showDriveTime)}
+            className="flex w-full items-center justify-between p-4 text-sm font-medium text-white hover:bg-[hsl(217,33%,20%)]"
+          >
+            <span className="flex items-center gap-2">
+              <Clock className="h-4 w-4" />
+              Drive Time Rings
+            </span>
+            {showDriveTime ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+          </button>
+          {showDriveTime && (
+            <div className="space-y-3 px-4 pb-4">
+              <p className="text-xs text-[hsl(215,20%,65%)]">
+                Creates non-overlapping donut rings (0-5, 5-10, 10-15 min)
+              </p>
+              <div className="space-y-2">
+                {driveTimeMinutes.map((value, index) => (
+                  <div key={index} className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      value={value}
+                      onChange={(e) => {
+                        const newValues = [...driveTimeMinutes]
+                        newValues[index] = Math.max(1, parseInt(e.target.value) || 1)
+                        setDriveTimeMinutes(newValues)
+                      }}
+                      className="w-16 rounded border border-[hsl(217,33%,25%)] bg-[hsl(222,47%,11%)] px-2 py-1 text-sm text-white"
+                      min="1"
+                    />
+                    <span className="text-sm text-[hsl(215,20%,65%)]">min</span>
+                    {driveTimeMinutes.length > 1 && (
+                      <button
+                        onClick={() => setDriveTimeMinutes(driveTimeMinutes.filter((_, i) => i !== index))}
+                        className="ml-auto rounded p-1 text-[hsl(215,20%,65%)] hover:bg-[hsl(217,33%,20%)] hover:text-white"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    )}
+                  </div>
+                ))}
               </div>
-              <div className="rounded-lg bg-muted p-2 text-center">
-                <p className="text-xs text-muted-foreground">Area</p>
-                <p className="text-lg font-bold">{stats.totalArea.toFixed(1)}</p>
-                <p className="text-xs text-muted-foreground">km2</p>
+              <button
+                onClick={() => setDriveTimeMinutes([...driveTimeMinutes, Math.max(...driveTimeMinutes) + 5])}
+                className="flex w-full items-center justify-center gap-1 rounded border border-dashed border-[hsl(217,33%,25%)] py-1.5 text-sm text-[hsl(215,20%,65%)] hover:border-[hsl(217,91%,60%)] hover:text-[hsl(217,91%,60%)]"
+              >
+                + Add Ring
+              </button>
+              <button
+                onClick={() => setIsPlacingMarker(true)}
+                className={cn(
+                  "flex w-full items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-white",
+                  isPlacingMarker ? "bg-amber-500" : "bg-[hsl(217,91%,60%)] hover:bg-[hsl(217,91%,50%)]"
+                )}
+              >
+                <MapPin className="h-4 w-4" />
+                {isPlacingMarker ? "Click on map..." : "Place Center Point"}
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Settings section */}
+        <div className="border-b border-[hsl(217,33%,25%)]">
+          <button
+            onClick={() => setShowSettings(!showSettings)}
+            className="flex w-full items-center justify-between p-4 text-sm font-medium text-white hover:bg-[hsl(217,33%,20%)]"
+          >
+            <span className="flex items-center gap-2">
+              <Settings className="h-4 w-4" />
+              Settings & Help
+            </span>
+            {showSettings ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+          </button>
+          {showSettings && (
+            <div className="space-y-4 px-4 pb-4">
+              <div>
+                <label className="mb-2 block text-xs text-[hsl(215,20%,65%)]">
+                  Simplify Tolerance: {simplifyTolerance.toFixed(4)}
+                </label>
+                <input
+                  type="range"
+                  min="0.0001"
+                  max="0.01"
+                  step="0.0001"
+                  value={simplifyTolerance}
+                  onChange={(e) => setSimplifyTolerance(parseFloat(e.target.value))}
+                  className="w-full"
+                />
               </div>
-              <div className="rounded-lg bg-muted p-2 text-center">
-                <p className="text-xs text-muted-foreground">Perimeter</p>
-                <p className="text-lg font-bold">{stats.totalPerimeter.toFixed(1)}</p>
-                <p className="text-xs text-muted-foreground">km</p>
+              <button
+                onClick={handleSimplifyAll}
+                disabled={zones.length === 0}
+                className="flex w-full items-center justify-center gap-2 rounded-md bg-[hsl(217,33%,25%)] px-3 py-2 text-sm font-medium text-white hover:bg-[hsl(217,33%,30%)] disabled:opacity-50"
+              >
+                <Scissors className="h-4 w-4" />
+                Simplify All Zones
+              </button>
+              <div className="rounded-lg bg-[hsl(217,33%,20%)] p-3 text-xs text-[hsl(215,20%,65%)]">
+                <p className="font-medium text-white mb-1">How to Cut/Split Zones:</p>
+                <p>Use the polyline tool (line icon, top right) to draw a cut line across zones. ALL zones the line crosses will be split into pieces.</p>
               </div>
             </div>
+          )}
+        </div>
 
-            <div className="flex flex-wrap gap-2 border-b border-border p-4">
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                className="flex items-center gap-1.5 rounded-md bg-secondary px-3 py-2 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80"
-              >
-                <Upload className="h-4 w-4" />
-                Import
-              </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".geojson,.json"
-                onChange={handleImportGeoJSON}
-                className="hidden"
-              />
-              <button
-                onClick={handleExportGeoJSON}
-                disabled={zones.length === 0}
-                className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
-              >
-                <Download className="h-4 w-4" />
-                Export
-              </button>
-              <button
-                onClick={handleCopyGeoJSON}
-                disabled={zones.length === 0}
-                className="flex items-center gap-1.5 rounded-md bg-secondary px-3 py-2 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80 disabled:opacity-50"
-              >
-                <Copy className="h-4 w-4" />
-                Copy
-              </button>
-              <button
-                onClick={handleClearAll}
-                disabled={zones.length === 0}
-                className="flex items-center gap-1.5 rounded-md bg-destructive px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-destructive/90 disabled:opacity-50"
-              >
-                <Trash2 className="h-4 w-4" />
-                Clear
-              </button>
+        {/* Zone list */}
+        <div className="flex-1 overflow-y-auto p-4">
+          <h2 className="mb-3 flex items-center gap-2 text-sm font-medium text-[hsl(215,20%,65%)]">
+            <Layers className="h-4 w-4" />
+            Zones ({zones.length})
+          </h2>
+          {zones.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-[hsl(217,33%,25%)] p-6 text-center">
+              <FileJson className="mx-auto mb-2 h-8 w-8 text-[hsl(215,20%,65%)]" />
+              <p className="text-sm text-[hsl(215,20%,65%)]">
+                Draw polygons on the map or import GeoJSON
+              </p>
             </div>
-
-            <div className="border-b border-border">
-              <button
-                onClick={() => setShowDriveTime(!showDriveTime)}
-                className="flex w-full items-center justify-between p-4 text-sm font-medium hover:bg-muted/50"
-              >
-                <span className="flex items-center gap-2">
-                  <Clock className="h-4 w-4" />
-                  Drive Time Rings
-                </span>
-                {showDriveTime ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-              </button>
-              {showDriveTime && (
-                <div className="space-y-3 px-4 pb-4">
-                  <p className="text-xs text-muted-foreground">
-                    Creates non-overlapping donut rings (e.g., 0-5, 5-10, 10-15 min)
-                  </p>
-                  <div className="space-y-2">
-                    {driveTimeMinutes.map((value, index) => (
-                      <div key={index} className="flex items-center gap-2">
-                        <input
-                          type="number"
-                          value={value}
-                          onChange={(e) => updateDriveTimeValue(index, parseInt(e.target.value) || 1)}
-                          className="w-16 rounded border border-border bg-background px-2 py-1 text-sm"
-                          min="1"
-                        />
-                        <span className="text-sm text-muted-foreground">min</span>
-                        {driveTimeMinutes.length > 1 && (
-                          <button
-                            onClick={() => removeDriveTimeValue(index)}
-                            className="ml-auto rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-                          >
-                            <Trash2 className="h-3 w-3" />
-                          </button>
+          ) : (
+            <div className="space-y-2">
+              {zones.map((zone) => (
+                <div
+                  key={zone.id}
+                  className={cn(
+                    "group rounded-lg border p-3 cursor-pointer",
+                    selectedZoneId === zone.id
+                      ? "border-[hsl(217,91%,60%)] bg-[hsl(217,91%,60%)]/10"
+                      : "border-[hsl(217,33%,25%)] hover:border-[hsl(217,91%,60%)]/50"
+                  )}
+                  onClick={() => setSelectedZoneId(zone.id)}
+                >
+                  <div className="flex items-center gap-2">
+                    <div className="h-4 w-4 rounded" style={{ backgroundColor: zone.color }} />
+                    <input
+                      type="text"
+                      value={zone.name}
+                      onChange={(e) => setZones((prev) => prev.map((z) => z.id === zone.id ? { ...z, name: e.target.value } : z))}
+                      onClick={(e) => e.stopPropagation()}
+                      className="flex-1 bg-transparent text-sm font-medium text-white outline-none"
+                    />
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleZoomToZone(zone) }}
+                      className="rounded p-1 opacity-0 group-hover:opacity-100 hover:bg-[hsl(217,33%,20%)] text-[hsl(215,20%,65%)]"
+                    >
+                      <Maximize2 className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setZones((prev) => prev.filter((z) => z.id !== zone.id)) }}
+                      className="rounded p-1 opacity-0 group-hover:opacity-100 hover:bg-[hsl(0,84%,60%)]/20 text-[hsl(0,84%,60%)]"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                  <div className="mt-2 flex gap-1">
+                    {ZONE_COLORS.map((color) => (
+                      <button
+                        key={color}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setZones((prev) => prev.map((z) => z.id === zone.id ? { ...z, color } : z))
+                        }}
+                        className={cn(
+                          "h-5 w-5 rounded hover:scale-110 transition-transform",
+                          zone.color === color && "ring-2 ring-white ring-offset-2 ring-offset-[hsl(222,47%,14%)]"
                         )}
-                      </div>
+                        style={{ backgroundColor: color }}
+                      />
                     ))}
                   </div>
-                  <button
-                    onClick={addDriveTimeValue}
-                    className="flex w-full items-center justify-center gap-1 rounded border border-dashed border-border py-1.5 text-sm text-muted-foreground hover:border-primary hover:text-primary"
-                  >
-                    + Add Ring
-                  </button>
-                  <button
-                    onClick={() => setIsPlacingMarker(true)}
-                    className={cn(
-                      "flex w-full items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors",
-                      isPlacingMarker
-                        ? "bg-amber-500 text-white"
-                        : "bg-primary text-primary-foreground hover:bg-primary/90"
-                    )}
-                  >
-                    <MapPin className="h-4 w-4" />
-                    {isPlacingMarker ? "Click on map..." : "Place Center Point"}
-                  </button>
                 </div>
-              )}
+              ))}
             </div>
-
-            <div className="border-b border-border">
-              <button
-                onClick={() => setShowSettings(!showSettings)}
-                className="flex w-full items-center justify-between p-4 text-sm font-medium hover:bg-muted/50"
-              >
-                <span className="flex items-center gap-2">
-                  <Settings className="h-4 w-4" />
-                  Settings
-                </span>
-                {showSettings ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-              </button>
-              {showSettings && (
-                <div className="space-y-4 px-4 pb-4">
-                  <div>
-                    <label className="mb-2 block text-xs text-muted-foreground">
-                      Simplify Tolerance: {simplifyTolerance.toFixed(4)}
-                    </label>
-                    <input
-                      type="range"
-                      min="0.0001"
-                      max="0.01"
-                      step="0.0001"
-                      value={simplifyTolerance}
-                      onChange={(e) => setSimplifyTolerance(parseFloat(e.target.value))}
-                      className="w-full"
-                    />
-                  </div>
-                  <button
-                    onClick={handleSimplifyAll}
-                    disabled={zones.length === 0}
-                    className="flex w-full items-center justify-center gap-2 rounded-md bg-secondary px-3 py-2 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80 disabled:opacity-50"
-                  >
-                    <Scissors className="h-4 w-4" />
-                    Simplify All Zones
-                  </button>
-                  <div className="rounded-lg bg-muted/50 p-3 text-xs text-muted-foreground">
-                    <p className="font-medium text-foreground mb-1">How to cut zones:</p>
-                    <p>Use the polyline tool (top right, the line icon) to draw a cutting line across your zones. When you finish the line, ALL zones it crosses will be split.</p>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className="flex-1 overflow-y-auto p-4">
-              <h2 className="mb-3 flex items-center gap-2 text-sm font-medium text-muted-foreground">
-                <Layers className="h-4 w-4" />
-                Zones ({zones.length})
-              </h2>
-              {zones.length === 0 ? (
-                <div className="rounded-lg border border-dashed border-border p-6 text-center">
-                  <FileJson className="mx-auto mb-2 h-8 w-8 text-muted-foreground" />
-                  <p className="text-sm text-muted-foreground">
-                    Draw polygons on the map or import a GeoJSON file
-                  </p>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  {zones.map((zone) => (
-                    <div
-                      key={zone.id}
-                      className={cn(
-                        "group rounded-lg border p-3 transition-colors",
-                        selectedZoneId === zone.id
-                          ? "border-primary bg-primary/10"
-                          : "border-border hover:border-primary/50"
-                      )}
-                      onClick={() => setSelectedZoneId(zone.id)}
-                    >
-                      <div className="flex items-center gap-2">
-                        <div className="h-4 w-4 rounded" style={{ backgroundColor: zone.color }} />
-                        <input
-                          type="text"
-                          value={zone.name}
-                          onChange={(e) => handleRenameZone(zone.id, e.target.value)}
-                          onClick={(e) => e.stopPropagation()}
-                          className="flex-1 bg-transparent text-sm font-medium outline-none focus:ring-1 focus:ring-primary"
-                        />
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            handleZoomToZone(zone)
-                          }}
-                          className="rounded p-1 opacity-0 transition-opacity hover:bg-muted group-hover:opacity-100"
-                          title="Zoom to zone"
-                        >
-                          <Maximize2 className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            handleDeleteZone(zone.id)
-                          }}
-                          className="rounded p-1 opacity-0 transition-opacity hover:bg-destructive/20 hover:text-destructive group-hover:opacity-100"
-                          title="Delete zone"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                      <div className="mt-2 flex gap-1">
-                        {ZONE_COLORS.map((color) => (
-                          <button
-                            key={color}
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              handleChangeZoneColor(zone.id, color)
-                            }}
-                            className={cn(
-                              "h-5 w-5 rounded transition-transform hover:scale-110",
-                              zone.color === color && "ring-2 ring-white ring-offset-2 ring-offset-card"
-                            )}
-                            style={{ backgroundColor: color }}
-                          />
-                        ))}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </>
-        )}
+          )}
+        </div>
       </div>
 
+      {/* Sidebar toggle */}
       <button
         onClick={() => setSidebarOpen(!sidebarOpen)}
-        className="absolute left-0 top-1/2 z-[1000] -translate-y-1/2 rounded-r-md bg-card p-2 shadow-lg transition-all hover:bg-muted"
+        className="absolute top-1/2 z-[1000] -translate-y-1/2 rounded-r-md bg-[hsl(222,47%,14%)] p-2 shadow-lg hover:bg-[hsl(217,33%,20%)]"
         style={{ left: sidebarOpen ? "320px" : "0" }}
       >
-        {sidebarOpen ? <ChevronDown className="h-4 w-4 rotate-90" /> : <ChevronDown className="h-4 w-4 -rotate-90" />}
+        <ChevronDown className={cn("h-4 w-4 text-white", sidebarOpen ? "rotate-90" : "-rotate-90")} />
       </button>
 
+      {/* Map */}
       <div ref={mapRef} className="flex-1" />
 
+      {/* Marker placement indicator */}
       {isPlacingMarker && (
         <div className="absolute bottom-8 left-1/2 z-[1000] -translate-x-1/2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white shadow-lg">
-          Click on the map to place the center point for drive-time rings
-          <button
-            onClick={() => setIsPlacingMarker(false)}
-            className="ml-3 rounded bg-white/20 px-2 py-0.5 text-xs hover:bg-white/30"
-          >
+          Click on map to place center point
+          <button onClick={() => setIsPlacingMarker(false)} className="ml-3 rounded bg-white/20 px-2 py-0.5 text-xs hover:bg-white/30">
             Cancel
           </button>
         </div>
