@@ -488,5 +488,5 @@ async def generate_isochrone(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# Export for Vercel
-handler = app
+# Export for Vercel - must be named 'app'
+# The 'app' variable is already defined above via fast_app()
