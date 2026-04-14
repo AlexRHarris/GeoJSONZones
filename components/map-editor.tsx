@@ -248,9 +248,10 @@ export default function MapEditor() {
     map.addControl(drawControl)
 
     // Handle created shapes
-    map.on(L.Draw.Event.CREATED, (e: L.DrawEvents.Created) => {
-      const layer = e.layer
-      const layerType = e.layerType
+    map.on(L.Draw.Event.CREATED, (e) => {
+      const event = e as L.DrawEvents.Created
+      const layer = event.layer
+      const layerType = event.layerType
 
       if (layerType === "polyline") {
         // Cut line - split all intersecting zones
@@ -280,8 +281,9 @@ export default function MapEditor() {
     })
 
     // Handle edited shapes
-    map.on(L.Draw.Event.EDITED, (e: L.DrawEvents.Edited) => {
-      const layers = e.layers
+    map.on(L.Draw.Event.EDITED, (e) => {
+      const event = e as L.DrawEvents.Edited
+      const layers = event.layers
       const updates: { id: string; geometry: GeoJSON.Polygon }[] = []
 
       layers.eachLayer((layer) => {
@@ -303,9 +305,10 @@ export default function MapEditor() {
     })
 
     // Handle deleted shapes
-    map.on(L.Draw.Event.DELETED, (e: L.DrawEvents.Deleted) => {
+    map.on(L.Draw.Event.DELETED, (e) => {
+      const event = e as L.DrawEvents.Deleted
       const deletedIds: string[] = []
-      e.layers.eachLayer((layer) => {
+      event.layers.eachLayer((layer) => {
         const zoneId = (layer as L.Layer & { zoneId?: string }).zoneId
         if (zoneId) deletedIds.push(zoneId)
       })
