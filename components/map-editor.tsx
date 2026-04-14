@@ -6,6 +6,7 @@ import "leaflet/dist/leaflet.css"
 import "leaflet-draw"
 import "leaflet-draw/dist/leaflet.draw.css"
 import * as turf from "@turf/turf"
+import polygonClipping from "polygon-clipping"
 import {
   Map,
   Layers,
@@ -30,7 +31,7 @@ interface Zone {
   color: string
   geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon
   properties: Record<string, unknown>
-  groupId?: string // Links zones that belong to the same drive-time set
+  groupId?: string
 }
 
 interface Stats {
@@ -40,23 +41,22 @@ interface Stats {
 }
 
 const ZONE_COLORS = [
-  "#3b82f6", // blue
-  "#10b981", // emerald
-  "#f59e0b", // amber
-  "#ef4444", // red
-  "#8b5cf6", // violet
-  "#ec4899", // pink
-  "#06b6d4", // cyan
-  "#84cc16", // lime
+  "#3b82f6",
+  "#10b981",
+  "#f59e0b",
+  "#ef4444",
+  "#8b5cf6",
+  "#ec4899",
+  "#06b6d4",
+  "#84cc16",
 ]
 
-// Different shades for drive-time rings
 const RING_COLORS = [
-  ["#1e40af", "#3b82f6", "#93c5fd"], // blue shades (inner to outer)
-  ["#065f46", "#10b981", "#6ee7b7"], // emerald shades
-  ["#92400e", "#f59e0b", "#fcd34d"], // amber shades
-  ["#991b1b", "#ef4444", "#fca5a5"], // red shades
-  ["#5b21b6", "#8b5cf6", "#c4b5fd"], // violet shades
+  ["#1e40af", "#3b82f6", "#93c5fd"],
+  ["#065f46", "#10b981", "#6ee7b7"],
+  ["#92400e", "#f59e0b", "#fcd34d"],
+  ["#991b1b", "#ef4444", "#fca5a5"],
+  ["#5b21b6", "#8b5cf6", "#c4b5fd"],
 ]
 
 export default function MapEditor() {
@@ -64,7 +64,7 @@ export default function MapEditor() {
   const mapInstanceRef = useRef<L.Map | null>(null)
   const drawnItemsRef = useRef<L.FeatureGroup | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const drawControlRef = useRef<L.Control.Draw | null>(null)
+  const zoneLayerMapRef = useRef<Map<string, L.Layer>>(new Map())
 
   const [zones, setZones] = useState<Zone[]>([])
   const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null)
@@ -76,9 +76,7 @@ export default function MapEditor() {
   const [driveTimeMinutes, setDriveTimeMinutes] = useState<number[]>([5, 10, 15])
   const [isPlacingMarker, setIsPlacingMarker] = useState(false)
   const [isCutMode, setIsCutMode] = useState(false)
-  const [cutLine, setCutLine] = useState<L.Polyline | null>(null)
 
-  // Calculate stats whenever zones change
   useEffect(() => {
     let totalArea = 0
     let totalPerimeter = 0
@@ -87,9 +85,11 @@ export default function MapEditor() {
       try {
         const feature = turf.feature(zone.geometry)
         totalArea += turf.area(feature)
-        const line = turf.polygonToLine(feature as turf.Feature<turf.Polygon>)
-        if (line.type === "Feature") {
-          totalPerimeter += turf.length(line, { units: "kilometers" })
+        if (zone.geometry.type === "Polygon") {
+          const line = turf.polygonToLine(feature as turf.Feature<turf.Polygon>)
+          if (line.type === "Feature") {
+            totalPerimeter += turf.length(line, { units: "kilometers" })
+          }
         }
       } catch {
         // Skip invalid geometries
@@ -98,10 +98,167 @@ export default function MapEditor() {
 
     setStats({
       totalZones: zones.length,
-      totalArea: totalArea / 1_000_000, // Convert to km²
+      totalArea: totalArea / 1_000_000,
       totalPerimeter,
     })
   }, [zones])
+
+  // Split a polygon with a line using polygon-clipping
+  const splitPolygonWithLine = useCallback((
+    polygon: GeoJSON.Polygon | GeoJSON.MultiPolygon,
+    lineCoords: [number, number][]
+  ): (GeoJSON.Polygon | GeoJSON.MultiPolygon)[] => {
+    if (lineCoords.length < 2) return [polygon]
+
+    // Get polygon bounds to extend the line
+    const feature = turf.feature(polygon)
+    const bbox = turf.bbox(feature)
+    const bboxWidth = bbox[2] - bbox[0]
+    const bboxHeight = bbox[3] - bbox[1]
+    const extend = Math.max(bboxWidth, bboxHeight) * 2
+
+    // Calculate line direction
+    const start = lineCoords[0]
+    const end = lineCoords[lineCoords.length - 1]
+    const dx = end[0] - start[0]
+    const dy = end[1] - start[1]
+    const len = Math.sqrt(dx * dx + dy * dy)
+    
+    if (len === 0) return [polygon]
+
+    const ux = dx / len
+    const uy = dy / len
+
+    // Extend line in both directions
+    const extendedStart: [number, number] = [start[0] - ux * extend, start[1] - uy * extend]
+    const extendedEnd: [number, number] = [end[0] + ux * extend, end[1] + uy * extend]
+
+    // Create a thin rectangle (blade) from the line
+    const bladeWidth = 0.00001 // Very thin
+    const perpX = -uy * bladeWidth
+    const perpY = ux * bladeWidth
+
+    // Build blade polygon coordinates
+    const bladeCoords: [number, number][] = [
+      [extendedStart[0] + perpX, extendedStart[1] + perpY],
+      [extendedEnd[0] + perpX, extendedEnd[1] + perpY],
+      [extendedEnd[0] - perpX, extendedEnd[1] - perpY],
+      [extendedStart[0] - perpX, extendedStart[1] - perpY],
+      [extendedStart[0] + perpX, extendedStart[1] + perpY],
+    ]
+
+    // Create two half-plane polygons (one on each side of the line)
+    const halfPlaneSize = extend * 2
+    
+    const halfPlane1Coords: [number, number][] = [
+      [extendedStart[0] + perpX, extendedStart[1] + perpY],
+      [extendedEnd[0] + perpX, extendedEnd[1] + perpY],
+      [extendedEnd[0] + perpX - uy * halfPlaneSize, extendedEnd[1] + perpY + ux * halfPlaneSize],
+      [extendedStart[0] + perpX - uy * halfPlaneSize, extendedStart[1] + perpY + ux * halfPlaneSize],
+      [extendedStart[0] + perpX, extendedStart[1] + perpY],
+    ]
+
+    const halfPlane2Coords: [number, number][] = [
+      [extendedStart[0] - perpX, extendedStart[1] - perpY],
+      [extendedEnd[0] - perpX, extendedEnd[1] - perpY],
+      [extendedEnd[0] - perpX + uy * halfPlaneSize, extendedEnd[1] - perpY - ux * halfPlaneSize],
+      [extendedStart[0] - perpX + uy * halfPlaneSize, extendedStart[1] - perpY - ux * halfPlaneSize],
+      [extendedStart[0] - perpX, extendedStart[1] - perpY],
+    ]
+
+    try {
+      // Convert polygon to polygon-clipping format
+      let polygonCoords: polygonClipping.Polygon[]
+      if (polygon.type === "Polygon") {
+        polygonCoords = [polygon.coordinates.map(ring => ring.map(c => [c[0], c[1]] as [number, number]))]
+      } else {
+        polygonCoords = polygon.coordinates.map(poly => 
+          poly.map(ring => ring.map(c => [c[0], c[1]] as [number, number]))
+        )
+      }
+
+      const results: (GeoJSON.Polygon | GeoJSON.MultiPolygon)[] = []
+
+      // Intersect with each half-plane
+      for (const halfPlane of [halfPlane1Coords, halfPlane2Coords]) {
+        for (const poly of polygonCoords) {
+          try {
+            const intersection = polygonClipping.intersection([poly], [[halfPlane]])
+            
+            if (intersection && intersection.length > 0) {
+              for (const resultPoly of intersection) {
+                if (resultPoly.length > 0 && resultPoly[0].length >= 4) {
+                  const geom: GeoJSON.Polygon = {
+                    type: "Polygon",
+                    coordinates: resultPoly,
+                  }
+                  // Check if it has meaningful area
+                  const area = turf.area(turf.feature(geom))
+                  if (area > 10) { // More than 10 square meters
+                    results.push(geom)
+                  }
+                }
+              }
+            }
+          } catch {
+            // Skip failed intersections
+          }
+        }
+      }
+
+      return results.length > 0 ? results : [polygon]
+    } catch {
+      return [polygon]
+    }
+  }, [])
+
+  // Cut all zones with a line
+  const cutAllZonesWithLine = useCallback((lineCoords: [number, number][]) => {
+    if (lineCoords.length < 2) return
+
+    const line = turf.lineString(lineCoords)
+
+    setZones((prevZones) => {
+      const newZones: Zone[] = []
+      let counter = 0
+
+      for (const zone of prevZones) {
+        try {
+          // Check if line intersects this zone
+          const polygon = turf.feature(zone.geometry)
+          const intersects = turf.booleanIntersects(line, polygon)
+
+          if (!intersects) {
+            newZones.push(zone)
+            continue
+          }
+
+          // Split the polygon
+          const splitResults = splitPolygonWithLine(zone.geometry, lineCoords)
+
+          if (splitResults.length <= 1) {
+            newZones.push(zone)
+            continue
+          }
+
+          // Create new zones from split results
+          splitResults.forEach((geom, i) => {
+            counter++
+            newZones.push({
+              ...zone,
+              id: `zone-${Date.now()}-${counter}`,
+              name: `${zone.name} (${String.fromCharCode(65 + i)})`,
+              geometry: geom,
+            })
+          })
+        } catch {
+          newZones.push(zone)
+        }
+      }
+
+      return newZones
+    })
+  }, [splitPolygonWithLine])
 
   // Initialize map
   useEffect(() => {
@@ -145,6 +302,7 @@ export default function MapEditor() {
           shapeOptions: {
             color: "#ff0000",
             weight: 3,
+            dashArray: "10, 10",
           },
         },
         circle: false,
@@ -158,85 +316,56 @@ export default function MapEditor() {
       },
     })
     map.addControl(drawControl)
-    drawControlRef.current = drawControl
 
+    // Handle created shapes
     map.on(L.Draw.Event.CREATED, (e: L.DrawEvents.Created) => {
       const layer = e.layer
       const layerType = e.layerType
 
       if (layerType === "polyline") {
-        // This is a cut line - process it
+        // This is a cut line
         const polyline = layer as L.Polyline
-        const lineCoords = polyline.getLatLngs() as L.LatLng[]
+        const latLngs = polyline.getLatLngs() as L.LatLng[]
         
-        if (lineCoords.length >= 2) {
-          const lineGeoJSON = turf.lineString(
-            lineCoords.map((ll) => [ll.lng, ll.lat])
-          )
-          
-          // Cut all intersecting zones
-          cutAllZonesWithLine(lineGeoJSON)
+        if (latLngs.length >= 2) {
+          const lineCoords: [number, number][] = latLngs.map((ll) => [ll.lng, ll.lat])
+          cutAllZonesWithLine(lineCoords)
         }
-        return // Don't add the line to the map
+        // Don't add the line to the map
+        return
       }
 
       // It's a polygon or rectangle
       const polygon = layer as L.Polygon
       const geoJson = polygon.toGeoJSON() as GeoJSON.Feature<GeoJSON.Polygon>
-      const colorIndex = zones.length % ZONE_COLORS.length
-      const newZone: Zone = {
-        id: `zone-${Date.now()}`,
-        name: `Zone ${zones.length + 1}`,
-        color: ZONE_COLORS[colorIndex],
-        geometry: geoJson.geometry,
-        properties: {},
-      }
-
-      ;(polygon as L.Path).setStyle({
-        color: newZone.color,
-        fillColor: newZone.color,
-        fillOpacity: 0.3,
+      
+      setZones((prev) => {
+        const colorIndex = prev.length % ZONE_COLORS.length
+        const newZone: Zone = {
+          id: `zone-${Date.now()}`,
+          name: `Zone ${prev.length + 1}`,
+          color: ZONE_COLORS[colorIndex],
+          geometry: geoJson.geometry,
+          properties: {},
+        }
+        return [...prev, newZone]
       })
-      ;(polygon as L.Polygon & { zoneId?: string }).zoneId = newZone.id
-
-      drawnItems.addLayer(polygon)
-      setZones((prev) => [...prev, newZone])
     })
 
+    // Handle edited shapes
     map.on(L.Draw.Event.EDITED, (e: L.DrawEvents.Edited) => {
       const layers = e.layers
       const updates: { id: string; geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon }[] = []
-      
+
       layers.eachLayer((layer) => {
-        // Handle both direct polygons and GeoJSON layers
-        const geoJsonLayer = layer as L.GeoJSON & { zoneId?: string; feature?: GeoJSON.Feature }
-        let zoneId: string | undefined
-        let geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon | undefined
-
-        // Check if it's a GeoJSON layer with nested layers
-        if (geoJsonLayer.getLayers) {
-          geoJsonLayer.eachLayer((innerLayer) => {
-            const innerPolygon = innerLayer as L.Polygon & { zoneId?: string }
-            if (innerPolygon.zoneId) {
-              zoneId = innerPolygon.zoneId
-              const geoJson = innerPolygon.toGeoJSON() as GeoJSON.Feature<GeoJSON.Polygon>
-              geometry = geoJson.geometry
-            }
-          })
-        }
+        const layerAny = layer as L.Layer & { zoneId?: string }
         
-        // Direct polygon
-        if (!zoneId) {
-          const polygon = layer as L.Polygon & { zoneId?: string }
-          zoneId = polygon.zoneId
-          if (zoneId) {
-            const geoJson = polygon.toGeoJSON() as GeoJSON.Feature<GeoJSON.Polygon>
-            geometry = geoJson.geometry
-          }
-        }
-
-        if (zoneId && geometry) {
-          updates.push({ id: zoneId, geometry })
+        // Get zoneId from the layer
+        const zoneId = layerAny.zoneId
+        
+        if (zoneId && layer instanceof L.Polygon) {
+          const geoJson = layer.toGeoJSON() as GeoJSON.Feature<GeoJSON.Polygon>
+          updates.push({ id: zoneId, geometry: geoJson.geometry })
         }
       })
 
@@ -250,29 +379,21 @@ export default function MapEditor() {
       }
     })
 
+    // Handle deleted shapes
     map.on(L.Draw.Event.DELETED, (e: L.DrawEvents.Deleted) => {
       const layers = e.layers
       const deletedIds: string[] = []
+
       layers.eachLayer((layer) => {
-        const geoJsonLayer = layer as L.GeoJSON & { zoneId?: string }
-        
-        // Check nested layers
-        if (geoJsonLayer.getLayers) {
-          geoJsonLayer.eachLayer((innerLayer) => {
-            const innerPolygon = innerLayer as L.Polygon & { zoneId?: string }
-            if (innerPolygon.zoneId) {
-              deletedIds.push(innerPolygon.zoneId)
-            }
-          })
-        }
-        
-        // Direct polygon
-        const polygon = layer as L.Polygon & { zoneId?: string }
-        if (polygon.zoneId) {
-          deletedIds.push(polygon.zoneId)
+        const layerAny = layer as L.Layer & { zoneId?: string }
+        if (layerAny.zoneId) {
+          deletedIds.push(layerAny.zoneId)
         }
       })
-      setZones((prev) => prev.filter((z) => !deletedIds.includes(z.id)))
+
+      if (deletedIds.length > 0) {
+        setZones((prev) => prev.filter((z) => !deletedIds.includes(z.id)))
+      }
     })
 
     mapInstanceRef.current = map
@@ -281,221 +402,82 @@ export default function MapEditor() {
       map.remove()
       mapInstanceRef.current = null
     }
-  }, [])
-
-  // Cut all zones with a line
-  const cutAllZonesWithLine = useCallback((line: turf.Feature<turf.LineString>) => {
-    setZones((prevZones) => {
-      const newZones: Zone[] = []
-      let zoneCounter = 0
-
-      prevZones.forEach((zone) => {
-        try {
-          const polygon = turf.feature(zone.geometry)
-          
-          // Check if line intersects this polygon
-          const intersects = turf.booleanIntersects(line, polygon)
-          
-          if (!intersects) {
-            newZones.push(zone)
-            return
-          }
-
-          // Extend the line beyond the polygon bounds to ensure clean cuts
-          const bbox = turf.bbox(polygon)
-          const extended = turf.lineString([
-            [bbox[0] - 1, line.geometry.coordinates[0][1]],
-            ...line.geometry.coordinates,
-            [bbox[2] + 1, line.geometry.coordinates[line.geometry.coordinates.length - 1][1]],
-          ])
-
-          // Split the polygon with the line
-          const split = turf.lineSplit(turf.polygonToLine(polygon as turf.Feature<turf.Polygon>), extended)
-          
-          if (split.features.length < 2) {
-            // Could not split, keep original
-            newZones.push(zone)
-            return
-          }
-
-          // Try to create polygons from the split lines
-          // Using a different approach: buffer the cut line and use difference
-          const bufferedLine = turf.buffer(line, 0.00001, { units: "kilometers" })
-          
-          if (!bufferedLine) {
-            newZones.push(zone)
-            return
-          }
-
-          // Use polygon-clipping for more reliable splitting
-          const difference = turf.difference(
-            turf.featureCollection([polygon as turf.Feature<turf.Polygon>]),
-            bufferedLine as turf.Feature<turf.Polygon>
-          )
-
-          if (!difference || difference.geometry.type === "Polygon") {
-            // Single polygon result, try using the line to create two halves
-            // Create a polygon from the line by extending it
-            const coords = line.geometry.coordinates
-            const start = coords[0]
-            const end = coords[coords.length - 1]
-            
-            // Calculate perpendicular direction for offset
-            const dx = end[0] - start[0]
-            const dy = end[1] - start[1]
-            const len = Math.sqrt(dx * dx + dy * dy)
-            const offsetDist = 10 // degrees offset (large to ensure coverage)
-            
-            // Create two half-planes
-            const halfPlane1 = turf.polygon([[
-              [start[0] - offsetDist * dy / len, start[1] + offsetDist * dx / len],
-              [end[0] - offsetDist * dy / len, end[1] + offsetDist * dx / len],
-              [end[0], end[1]],
-              [start[0], start[1]],
-              [start[0] - offsetDist * dy / len, start[1] + offsetDist * dx / len],
-            ]])
-
-            const halfPlane2 = turf.polygon([[
-              [start[0] + offsetDist * dy / len, start[1] - offsetDist * dx / len],
-              [end[0] + offsetDist * dy / len, end[1] - offsetDist * dx / len],
-              [end[0], end[1]],
-              [start[0], start[1]],
-              [start[0] + offsetDist * dy / len, start[1] - offsetDist * dx / len],
-            ]])
-
-            try {
-              const part1 = turf.intersect(turf.featureCollection([polygon as turf.Feature<turf.Polygon>, halfPlane1]))
-              const part2 = turf.intersect(turf.featureCollection([polygon as turf.Feature<turf.Polygon>, halfPlane2]))
-
-              if (part1 && turf.area(part1) > 100) {
-                zoneCounter++
-                newZones.push({
-                  ...zone,
-                  id: `zone-${Date.now()}-${zoneCounter}`,
-                  name: `${zone.name} (A)`,
-                  geometry: part1.geometry as GeoJSON.Polygon | GeoJSON.MultiPolygon,
-                })
-              }
-
-              if (part2 && turf.area(part2) > 100) {
-                zoneCounter++
-                newZones.push({
-                  ...zone,
-                  id: `zone-${Date.now()}-${zoneCounter}`,
-                  name: `${zone.name} (B)`,
-                  geometry: part2.geometry as GeoJSON.Polygon | GeoJSON.MultiPolygon,
-                })
-              }
-
-              if (newZones.length === prevZones.length) {
-                // No new zones created, keep original
-                newZones.push(zone)
-              }
-            } catch {
-              newZones.push(zone)
-            }
-            return
-          }
-
-          // MultiPolygon result - each part becomes a new zone
-          if (difference.geometry.type === "MultiPolygon") {
-            difference.geometry.coordinates.forEach((coords, i) => {
-              zoneCounter++
-              newZones.push({
-                ...zone,
-                id: `zone-${Date.now()}-${zoneCounter}`,
-                name: `${zone.name} (${String.fromCharCode(65 + i)})`,
-                geometry: { type: "Polygon", coordinates: coords },
-              })
-            })
-          }
-        } catch {
-          // Keep original zone on error
-          newZones.push(zone)
-        }
-      })
-
-      return newZones
-    })
-  }, [])
+  }, [cutAllZonesWithLine])
 
   // Sync zones to map layers
-  const syncZonesToMap = useCallback(() => {
+  useEffect(() => {
     if (!drawnItemsRef.current || !mapInstanceRef.current) return
 
     drawnItemsRef.current.clearLayers()
+    zoneLayerMapRef.current.clear()
 
     zones.forEach((zone) => {
       try {
-        const geoJsonLayer = L.geoJSON(
-          { type: "Feature", geometry: zone.geometry, properties: zone.properties },
+        const polygon = L.polygon(
+          zone.geometry.type === "Polygon"
+            ? zone.geometry.coordinates[0].map((c) => [c[1], c[0]] as [number, number])
+            : zone.geometry.coordinates[0][0].map((c) => [c[1], c[0]] as [number, number]),
           {
-            style: {
-              color: zone.color,
-              fillColor: zone.color,
-              fillOpacity: selectedZoneId === zone.id ? 0.5 : 0.3,
-              weight: selectedZoneId === zone.id ? 3 : 2,
-            },
-            onEachFeature: (_, layer) => {
-              ;(layer as L.Polygon & { zoneId?: string }).zoneId = zone.id
-              layer.on("click", () => {
-                setSelectedZoneId(zone.id)
-              })
-            },
+            color: zone.color,
+            fillColor: zone.color,
+            fillOpacity: selectedZoneId === zone.id ? 0.5 : 0.3,
+            weight: selectedZoneId === zone.id ? 3 : 2,
           }
         )
-        // Also set zoneId on the GeoJSON layer itself for edit detection
-        ;(geoJsonLayer as L.GeoJSON & { zoneId?: string }).zoneId = zone.id
-        drawnItemsRef.current?.addLayer(geoJsonLayer)
+
+        // Attach zoneId for edit/delete handling
+        ;(polygon as L.Polygon & { zoneId?: string }).zoneId = zone.id
+
+        polygon.on("click", () => {
+          setSelectedZoneId(zone.id)
+        })
+
+        drawnItemsRef.current?.addLayer(polygon)
+        zoneLayerMapRef.current.set(zone.id, polygon)
       } catch {
         // Skip invalid geometries
       }
     })
   }, [zones, selectedZoneId])
 
-  useEffect(() => {
-    syncZonesToMap()
-  }, [syncZonesToMap])
-
-  // Generate drive-time rings (donut shaped - no overlap)
+  // Generate drive-time rings
   const generateDriveTimeRings = useCallback((latlng: L.LatLng) => {
     const center = [latlng.lng, latlng.lat] as [number, number]
     const groupId = `drivetime-${Date.now()}`
     const colorSetIndex = Math.floor(Math.random() * RING_COLORS.length)
     const colorSet = RING_COLORS[colorSetIndex]
-    
-    // Sort drive times to ensure proper ordering
+
     const sortedMinutes = [...driveTimeMinutes].sort((a, b) => a - b)
-    
-    // Approximate: 1 minute = ~1.2 km at average driving speed of 72 km/h
     const kmPerMinute = 1.2
-    
+
     const newZones: Zone[] = []
-    let previousRing: turf.Feature<turf.Polygon> | null = null
+    let previousCircle: turf.Feature<turf.Polygon> | null = null
 
     sortedMinutes.forEach((minutes, index) => {
       const radiusKm = minutes * kmPerMinute
       const circle = turf.circle(center, radiusKm, { units: "kilometers", steps: 64 })
-      
+
       let ringGeometry: GeoJSON.Polygon | GeoJSON.MultiPolygon
-      
-      if (previousRing) {
-        // Subtract the previous (smaller) ring to create a donut
-        const donut = turf.difference(
-          turf.featureCollection([circle, previousRing])
-        )
-        if (donut) {
-          ringGeometry = donut.geometry as GeoJSON.Polygon | GeoJSON.MultiPolygon
-        } else {
+
+      if (previousCircle) {
+        try {
+          const donut = turf.difference(
+            turf.featureCollection([circle, previousCircle])
+          )
+          if (donut) {
+            ringGeometry = donut.geometry as GeoJSON.Polygon | GeoJSON.MultiPolygon
+          } else {
+            ringGeometry = circle.geometry
+          }
+        } catch {
           ringGeometry = circle.geometry
         }
       } else {
-        // First (innermost) ring is a full circle
         ringGeometry = circle.geometry
       }
 
       const prevMinutes = index === 0 ? 0 : sortedMinutes[index - 1]
-      
+
       newZones.push({
         id: `zone-${Date.now()}-${index}`,
         name: `${prevMinutes}-${minutes} min`,
@@ -508,13 +490,12 @@ export default function MapEditor() {
         groupId,
       })
 
-      previousRing = circle
+      previousCircle = circle
     })
 
     setZones((prev) => [...prev, ...newZones])
     setIsPlacingMarker(false)
 
-    // Fit map to the new rings
     if (mapInstanceRef.current && newZones.length > 0) {
       const lastRing = newZones[newZones.length - 1]
       const bbox = turf.bbox(turf.feature(lastRing.geometry))
@@ -525,7 +506,7 @@ export default function MapEditor() {
     }
   }, [driveTimeMinutes])
 
-  // Handle marker placement for drive-time rings
+  // Handle marker placement
   useEffect(() => {
     if (!mapInstanceRef.current) return
 
@@ -590,9 +571,7 @@ export default function MapEditor() {
         }
 
         const importedZones: Zone[] = geoJson.features
-          .filter(
-            (f) => f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon"
-          )
+          .filter((f) => f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon")
           .map((f, i) => ({
             id: `zone-${Date.now()}-${i}`,
             name: (f.properties?.name as string) || `Imported Zone ${i + 1}`,
@@ -603,7 +582,6 @@ export default function MapEditor() {
 
         setZones((prev) => [...prev, ...importedZones])
 
-        // Fit map to imported zones
         if (importedZones.length > 0 && mapInstanceRef.current) {
           const allFeatures = turf.featureCollection(
             importedZones.map((z) => turf.feature(z.geometry))
@@ -722,13 +700,11 @@ export default function MapEditor() {
       >
         {sidebarOpen && (
           <>
-            {/* Header */}
             <div className="flex items-center gap-2 border-b border-border p-4">
               <Map className="h-5 w-5 text-primary" />
               <h1 className="text-lg font-semibold">GeoJSON Zones</h1>
             </div>
 
-            {/* Stats */}
             <div className="grid grid-cols-3 gap-2 border-b border-border p-4">
               <div className="rounded-lg bg-muted p-2 text-center">
                 <p className="text-xs text-muted-foreground">Zones</p>
@@ -746,7 +722,6 @@ export default function MapEditor() {
               </div>
             </div>
 
-            {/* Actions */}
             <div className="flex flex-wrap gap-2 border-b border-border p-4">
               <button
                 onClick={() => fileInputRef.current?.click()}
@@ -788,7 +763,6 @@ export default function MapEditor() {
               </button>
             </div>
 
-            {/* Drive Time Rings */}
             <div className="border-b border-border">
               <button
                 onClick={() => setShowDriveTime(!showDriveTime)}
@@ -798,11 +772,7 @@ export default function MapEditor() {
                   <Clock className="h-4 w-4" />
                   Drive Time Rings
                 </span>
-                {showDriveTime ? (
-                  <ChevronUp className="h-4 w-4" />
-                ) : (
-                  <ChevronDown className="h-4 w-4" />
-                )}
+                {showDriveTime ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
               </button>
               {showDriveTime && (
                 <div className="space-y-3 px-4 pb-4">
@@ -853,7 +823,6 @@ export default function MapEditor() {
               )}
             </div>
 
-            {/* Settings */}
             <div className="border-b border-border">
               <button
                 onClick={() => setShowSettings(!showSettings)}
@@ -863,11 +832,7 @@ export default function MapEditor() {
                   <Settings className="h-4 w-4" />
                   Settings
                 </span>
-                {showSettings ? (
-                  <ChevronUp className="h-4 w-4" />
-                ) : (
-                  <ChevronDown className="h-4 w-4" />
-                )}
+                {showSettings ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
               </button>
               {showSettings && (
                 <div className="space-y-4 px-4 pb-4">
@@ -893,14 +858,14 @@ export default function MapEditor() {
                     <Scissors className="h-4 w-4" />
                     Simplify All Zones
                   </button>
-                  <p className="text-xs text-muted-foreground">
-                    Tip: Use the polyline tool (top right) to draw a line that cuts through zones. All intersected zones will be split.
-                  </p>
+                  <div className="rounded-lg bg-muted/50 p-3 text-xs text-muted-foreground">
+                    <p className="font-medium text-foreground mb-1">How to cut zones:</p>
+                    <p>Use the polyline tool (top right, the line icon) to draw a cutting line across your zones. When you finish the line, ALL zones it crosses will be split.</p>
+                  </div>
                 </div>
               )}
             </div>
 
-            {/* Zone List */}
             <div className="flex-1 overflow-y-auto p-4">
               <h2 className="mb-3 flex items-center gap-2 text-sm font-medium text-muted-foreground">
                 <Layers className="h-4 w-4" />
@@ -927,10 +892,7 @@ export default function MapEditor() {
                       onClick={() => setSelectedZoneId(zone.id)}
                     >
                       <div className="flex items-center gap-2">
-                        <div
-                          className="h-4 w-4 rounded"
-                          style={{ backgroundColor: zone.color }}
-                        />
+                        <div className="h-4 w-4 rounded" style={{ backgroundColor: zone.color }} />
                         <input
                           type="text"
                           value={zone.name}
@@ -984,23 +946,16 @@ export default function MapEditor() {
         )}
       </div>
 
-      {/* Toggle Sidebar Button */}
       <button
         onClick={() => setSidebarOpen(!sidebarOpen)}
         className="absolute left-0 top-1/2 z-[1000] -translate-y-1/2 rounded-r-md bg-card p-2 shadow-lg transition-all hover:bg-muted"
         style={{ left: sidebarOpen ? "320px" : "0" }}
       >
-        {sidebarOpen ? (
-          <ChevronDown className="h-4 w-4 rotate-90" />
-        ) : (
-          <ChevronDown className="h-4 w-4 -rotate-90" />
-        )}
+        {sidebarOpen ? <ChevronDown className="h-4 w-4 rotate-90" /> : <ChevronDown className="h-4 w-4 -rotate-90" />}
       </button>
 
-      {/* Map */}
       <div ref={mapRef} className="flex-1" />
 
-      {/* Marker placement indicator */}
       {isPlacingMarker && (
         <div className="absolute bottom-8 left-1/2 z-[1000] -translate-x-1/2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white shadow-lg">
           Click on the map to place the center point for drive-time rings
