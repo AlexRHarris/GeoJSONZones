@@ -363,11 +363,11 @@ export default function MapEditor() {
     const kmPerMinute = 1.2
 
     const newZones: Zone[] = []
-    let previousCircle: turf.Feature<turf.Polygon> | null = null
+    let previousCircle: GeoJSON.Feature<GeoJSON.Polygon> | null = null
 
     sortedMinutes.forEach((minutes, index) => {
       const radiusKm = minutes * kmPerMinute
-      const circle = turf.circle(center, radiusKm, { units: "kilometers", steps: 64 })
+      const circle: GeoJSON.Feature<GeoJSON.Polygon> = turf.circle(center, radiusKm, { units: "kilometers", steps: 64 })
 
       let ringGeometry: GeoJSON.Polygon | GeoJSON.MultiPolygon
 
