@@ -243,7 +243,6 @@ export default function MapEditor() {
       edit: {
         featureGroup: drawnItems,
         remove: true,
-        edit: true,
       },
     })
     map.addControl(drawControl)
